@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Vet and test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.22", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -race ./...
+
+  conformance:
+    name: Conformance and examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: FireMQ/firemq
+          # The head of FireMQ/firemq#38, which adds the conformance suite.
+          # Move this ref to main once FireMQ/firemq#38 merges.
+          ref: b90a2ff9bda15a398c6957bfb291e4a9db9957ab
+          path: firemq
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firemq
+      - name: Build the broker and the conformance runner
+        working-directory: firemq
+        run: cargo build -p firemq -p firemq-conformance
+      - name: Run the conformance suite
+        run: firemq/target/debug/firemq-conformance run --driver "go run ./conformance/driver"
+      - name: Start a broker
+        run: |
+          firemq/target/debug/firemq --ephemeral \
+            --amqp 127.0.0.1:5672 --fire 127.0.0.1:5673 --http 127.0.0.1:15672 \
+            --amqps off --fires off > broker.log 2>&1 &
+          for _ in $(seq 1 50); do
+            nc -z 127.0.0.1 5673 && exit 0
+            sleep 0.2
+          done
+          cat broker.log
+          exit 1
+      - name: Run the integration tests
+        env:
+          FIREMQ_URL: fire://127.0.0.1:5673
+        run: go test -race -run Integration -v .
+      - name: Run the examples
+        env:
+          FIREMQ_URL: fire://127.0.0.1:5673
+        run: |
+          for example in examples/*/; do
+            echo "::group::$example"
+            timeout 60 go run "./$example"
+            echo "::endgroup::"
+          done
+      - name: Show the broker log
+        if: failure()
+        run: cat broker.log || true
